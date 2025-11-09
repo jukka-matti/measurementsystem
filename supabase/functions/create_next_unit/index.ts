@@ -19,25 +19,61 @@ serve(async (req) => {
       return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 })
     }
 
-    const supabase = createClient(
+    // Create Supabase client with service role for admin operations
+    const supabaseAdmin = createClient(
       Deno.env.get('SUPABASE_URL') ?? '',
-      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '',
-      {
-        global: {
-          headers: { Authorization: authHeader },
-        },
-      }
+      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
     )
 
+    // Extract user_id from JWT token
+    const token = authHeader.replace('Bearer ', '')
+    const payload = JSON.parse(
+      atob(token.split('.')[1])
+    )
+    const userId = payload.sub
+
+    if (!userId) {
+      return new Response(JSON.stringify({ error: 'Invalid token' }), { status: 401 })
+    }
+
+    // Get user's org_id from org_members table (never trust client)
+    const { data: orgMember, error: orgError } = await supabaseAdmin
+      .from('org_members')
+      .select('org_id')
+      .eq('user_id', userId)
+      .limit(1)
+      .single()
+
+    if (orgError || !orgMember) {
+      return new Response(
+        JSON.stringify({ error: 'User not associated with an organization' }),
+        { status: 403 }
+      )
+    }
+
+    const orgId = orgMember.org_id
+
+    // Verify batch belongs to user's org
+    const { data: batch, error: batchError } = await supabaseAdmin
+      .from('unit_batches')
+      .select('org_id')
+      .eq('id', data.batch_id)
+      .eq('org_id', orgId)
+      .single()
+
+    if (batchError || !batch) {
+      return new Response(JSON.stringify({ error: 'Batch not found' }), { status: 404 })
+    }
+
     // Call the database function
-    const { data: unitId, error } = await supabase.rpc('create_next_unit', {
+    const { data: unitId, error } = await supabaseAdmin.rpc('create_next_unit', {
       p_batch_id: data.batch_id,
     })
 
     if (error) throw error
 
     // Get the created unit
-    const { data: unit } = await supabase
+    const { data: unit } = await supabaseAdmin
       .from('units')
       .select('id, unit_number')
       .eq('id', unitId)

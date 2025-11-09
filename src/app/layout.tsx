@@ -1,5 +1,8 @@
 import type { Metadata } from 'next'
 import './globals.css'
+import { AuthProvider } from '@/lib/auth'
+import { ToastProvider } from '@/lib/toast'
+import { AppHeader } from '@/components/AppHeader'
 
 export const metadata: Metadata = {
   title: 'Measurement System',
@@ -13,7 +16,14 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en">
-      <body>{children}</body>
+      <body>
+        <AuthProvider>
+          <ToastProvider>
+            <AppHeader />
+            {children}
+          </ToastProvider>
+        </AuthProvider>
+      </body>
     </html>
   )
 }

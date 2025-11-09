@@ -6,10 +6,10 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 
 serve(async (req) => {
   try {
-    const url = new URL(req.url)
-    const startDate = url.searchParams.get('start_date')
-    const endDate = url.searchParams.get('end_date')
-    const stage = url.searchParams.get('stage')
+    const body = await req.json()
+    const startDate = body.start_date
+    const endDate = body.end_date
+    const stage = body.stage
 
     if (!startDate || !endDate) {
       return new Response(
@@ -23,20 +23,45 @@ serve(async (req) => {
       return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 })
     }
 
-    const supabase = createClient(
+    // Create Supabase client with service role for admin operations
+    const supabaseAdmin = createClient(
       Deno.env.get('SUPABASE_URL') ?? '',
-      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '',
-      {
-        global: {
-          headers: { Authorization: authHeader },
-        },
-      }
+      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
     )
 
+    // Extract user_id from JWT token
+    const token = authHeader.replace('Bearer ', '')
+    const payload = JSON.parse(
+      atob(token.split('.')[1])
+    )
+    const userId = payload.sub
+
+    if (!userId) {
+      return new Response(JSON.stringify({ error: 'Invalid token' }), { status: 401 })
+    }
+
+    // Get user's org_id from org_members table (never trust client)
+    const { data: orgMember, error: orgError } = await supabaseAdmin
+      .from('org_members')
+      .select('org_id')
+      .eq('user_id', userId)
+      .limit(1)
+      .single()
+
+    if (orgError || !orgMember) {
+      return new Response(
+        JSON.stringify({ error: 'User not associated with an organization' }),
+        { status: 403 }
+      )
+    }
+
+    const orgId = orgMember.org_id
+
     // Build query
-    let query = supabase
+    let query = supabaseAdmin
       .from('events')
       .select('*')
+      .eq('org_id', orgId)
       .gte('ts_server', startDate)
       .lte('ts_server', endDate)
 
@@ -44,7 +69,7 @@ serve(async (req) => {
       query = query.eq('stage', stage)
     }
 
-    const { data: events, error } = await query
+    const { data: events, error } = await query.order('ts_server', { ascending: true })
 
     if (error) throw error
 

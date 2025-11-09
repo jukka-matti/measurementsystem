@@ -38,15 +38,50 @@ serve(async (req) => {
       return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 })
     }
 
+    // Create Supabase client with service role for admin operations
+    const supabaseAdmin = createClient(
+      Deno.env.get('SUPABASE_URL') ?? '',
+      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
+    )
+
+    // Create client with user's auth token for RLS
     const supabase = createClient(
       Deno.env.get('SUPABASE_URL') ?? '',
-      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '',
+      Deno.env.get('SUPABASE_ANON_KEY') ?? '',
       {
         global: {
           headers: { Authorization: authHeader },
         },
       }
     )
+
+    // Extract user_id from JWT token
+    const token = authHeader.replace('Bearer ', '')
+    const payload = JSON.parse(
+      atob(token.split('.')[1])
+    )
+    const userId = payload.sub
+
+    if (!userId) {
+      return new Response(JSON.stringify({ error: 'Invalid token' }), { status: 401 })
+    }
+
+    // Get user's org_id from org_members table (never trust client)
+    const { data: orgMember, error: orgError } = await supabaseAdmin
+      .from('org_members')
+      .select('org_id')
+      .eq('user_id', userId)
+      .limit(1)
+      .single()
+
+    if (orgError || !orgMember) {
+      return new Response(
+        JSON.stringify({ error: 'User not associated with an organization' }),
+        { status: 403 }
+      )
+    }
+
+    const orgId = orgMember.org_id
 
     // Generate idempotency key
     const tsSeconds = Math.floor(new Date(data.ts_device).getTime() / 1000)
@@ -60,7 +95,7 @@ serve(async (req) => {
     )
 
     // Check for duplicate
-    const { data: existing } = await supabase
+    const { data: existing } = await supabaseAdmin
       .from('events')
       .select('id')
       .eq('idempotency_key', idempotencyKey)
@@ -73,12 +108,8 @@ serve(async (req) => {
       )
     }
 
-    // Get user's org_id from JWT (extract from auth.users via org_members)
-    // This is a placeholder - actual implementation needs to extract from JWT
-    const orgId = '00000000-0000-0000-0000-000000000001' // TODO: Extract from JWT
-
-    // Insert event
-    const { data: event, error } = await supabase
+    // Insert event (use admin client to bypass RLS, but org_id is validated)
+    const { data: event, error } = await supabaseAdmin
       .from('events')
       .insert({
         org_id: orgId,
@@ -87,6 +118,7 @@ serve(async (req) => {
         stage: data.stage,
         type: data.type,
         workstation_id: data.workstation_id,
+        user_id: userId,
         ts_device: data.ts_device,
         idempotency_key: idempotencyKey,
         qty_good: data.qty_good ?? 0,

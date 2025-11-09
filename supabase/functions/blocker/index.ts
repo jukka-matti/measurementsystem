@@ -28,36 +28,62 @@ serve(async (req) => {
       return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 })
     }
 
-    const supabase = createClient(
+    // Create Supabase client with service role for admin operations
+    const supabaseAdmin = createClient(
       Deno.env.get('SUPABASE_URL') ?? '',
-      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '',
-      {
-        global: {
-          headers: { Authorization: authHeader },
-        },
-      }
+      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
     )
 
-    // Get unit to find order_id and org_id
-    const { data: unit } = await supabase
+    // Extract user_id from JWT token
+    const token = authHeader.replace('Bearer ', '')
+    const payload = JSON.parse(
+      atob(token.split('.')[1])
+    )
+    const userId = payload.sub
+
+    if (!userId) {
+      return new Response(JSON.stringify({ error: 'Invalid token' }), { status: 401 })
+    }
+
+    // Get user's org_id from org_members table (never trust client)
+    const { data: orgMember, error: orgError } = await supabaseAdmin
+      .from('org_members')
+      .select('org_id')
+      .eq('user_id', userId)
+      .limit(1)
+      .single()
+
+    if (orgError || !orgMember) {
+      return new Response(
+        JSON.stringify({ error: 'User not associated with an organization' }),
+        { status: 403 }
+      )
+    }
+
+    const orgId = orgMember.org_id
+
+    // Get unit to find order_id (verify it belongs to user's org)
+    const { data: unit, error: unitError } = await supabaseAdmin
       .from('units')
       .select('order_id, org_id')
       .eq('id', data.unit_id)
+      .eq('org_id', orgId)
       .single()
 
-    if (!unit) {
+    if (unitError || !unit) {
       return new Response(JSON.stringify({ error: 'Unit not found' }), { status: 404 })
     }
 
     // Insert blocker event
-    const { data: event, error } = await supabase
+    const { data: event, error } = await supabaseAdmin
       .from('events')
       .insert({
-        org_id: unit.org_id,
+        org_id: orgId,
         unit_id: data.unit_id,
         order_id: unit.order_id,
         stage: data.stage,
         type: 'blocker',
+        user_id: userId,
         blocker_code: data.blocker_code,
         blocker_minutes: data.blocker_minutes,
         ts_device: new Date().toISOString(),
