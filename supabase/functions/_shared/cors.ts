@@ -1,11 +1,22 @@
 // CORS utilities for Edge Functions
 
-const ALLOWED_ORIGINS = [
-  'http://localhost:3000',
-  'https://localhost:3000',
-  // Add production domains here
-  // 'https://your-domain.vercel.app',
-]
+/**
+ * Gets allowed origins from environment variable or defaults
+ * Format: comma-separated list of origins
+ * Example: ALLOWED_ORIGINS=http://localhost:3000,https://your-domain.vercel.app
+ */
+function getAllowedOrigins(): string[] {
+  const envOrigins = Deno.env.get('ALLOWED_ORIGINS')
+  if (envOrigins) {
+    return envOrigins.split(',').map(origin => origin.trim())
+  }
+  
+  // Default origins for development
+  return [
+    'http://localhost:3000',
+    'https://localhost:3000',
+  ]
+}
 
 /**
  * Gets CORS headers for a request
@@ -17,7 +28,9 @@ export function getCorsHeaders(origin: string | null): HeadersInit {
     'Access-Control-Max-Age': '86400',
   }
 
-  if (origin && ALLOWED_ORIGINS.includes(origin)) {
+  const allowedOrigins = getAllowedOrigins()
+  
+  if (origin && allowedOrigins.includes(origin)) {
     headers['Access-Control-Allow-Origin'] = origin
   }
 
