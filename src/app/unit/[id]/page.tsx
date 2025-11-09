@@ -50,6 +50,8 @@ function UnitDetailContent({ unitId }: { unitId: string }) {
 
   const loadUnitData = async () => {
     try {
+      setError(null)
+      
       // Load unit with order
       const { data: unitData, error: unitError } = await supabase
         .from('units')
@@ -57,7 +59,27 @@ function UnitDetailContent({ unitId }: { unitId: string }) {
         .eq('id', unitId)
         .single()
 
-      if (unitError) throw unitError
+      if (unitError) {
+        // Handle specific error cases
+        if (unitError.code === 'PGRST116') {
+          // Not found - could be unauthorized or doesn't exist
+          setError('Unit not found or you do not have access to it')
+          setLoading(false)
+          return
+        } else if (unitError.code === '42501' || unitError.message?.includes('permission')) {
+          // Permission denied - RLS blocked access
+          setError('You do not have permission to access this unit')
+          setLoading(false)
+          return
+        }
+        throw unitError
+      }
+
+      if (!unitData) {
+        setError('Unit not found')
+        setLoading(false)
+        return
+      }
 
       setUnit(unitData as Unit)
       setOrder((unitData as any).orders as Order)
@@ -69,8 +91,13 @@ function UnitDetailContent({ unitId }: { unitId: string }) {
         .eq('unit_id', unitId)
         .order('ts_server', { ascending: true })
 
-      if (eventsError) throw eventsError
-      setEvents(eventsData || [])
+      if (eventsError) {
+        // Log but don't fail - events might be empty
+        console.warn('Error loading events:', eventsError)
+        setEvents([])
+      } else {
+        setEvents(eventsData || [])
+      }
 
       // Load workstation if session has one
       if (session?.workstation_id) {
@@ -86,7 +113,9 @@ function UnitDetailContent({ unitId }: { unitId: string }) {
       // Update session with current unit
       await updateSession({ unit_id: unitId })
     } catch (err: any) {
-      setError(err.message)
+      // Handle unexpected errors
+      const errorMessage = err.message || 'An unexpected error occurred'
+      setError(errorMessage)
       console.error('Error loading unit:', err)
     } finally {
       setLoading(false)
@@ -211,8 +240,21 @@ function UnitDetailContent({ unitId }: { unitId: string }) {
 
   if (error || !unit) {
     return (
-      <div className="flex min-h-screen items-center justify-center">
-        <div className="text-red-600">Error: {error || 'Unit not found'}</div>
+      <div className="flex min-h-screen flex-col">
+        <TopBarContext />
+        <div className="flex flex-1 items-center justify-center p-4">
+          <div className="text-center">
+            <div className="mb-4 text-2xl font-semibold text-red-600">
+              {error || 'Unit not found'}
+            </div>
+            <button
+              onClick={() => router.push('/units')}
+              className="rounded-lg bg-blue-600 px-4 py-2 text-white hover:bg-blue-700"
+            >
+              Back to Units
+            </button>
+          </div>
+        </div>
       </div>
     )
   }

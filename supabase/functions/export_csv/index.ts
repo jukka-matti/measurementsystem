@@ -2,78 +2,80 @@
 // Exports events as CSV for a date range
 
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+import { z } from 'https://deno.land/x/zod@v3.22.4/mod.ts'
+import { authenticateRequest } from '../_shared/auth.ts'
+import { createErrorResponse, createSuccessResponse, AppError, ErrorCodes } from '../_shared/errors.ts'
+import { getCorsHeaders, handleCorsPreflight } from '../_shared/cors.ts'
+import { checkRateLimit } from '../_shared/rate-limit.ts'
+import { readRequestBody } from '../_shared/validation.ts'
+import { logAuditEvent } from '../_shared/audit.ts'
+
+const exportSchema = z.object({
+  start_date: z.string().regex(/^\d{4}-\d{2}-\d{2}/, 'Invalid date format. Use YYYY-MM-DD'),
+  end_date: z.string().regex(/^\d{4}-\d{2}-\d{2}/, 'Invalid date format. Use YYYY-MM-DD'),
+  stage: z.enum(['order_info', 'bead_prep', 'insert_beads', 'pack', 'ship']).optional(),
+})
+
+const MAX_DATE_RANGE_DAYS = 365 // Limit to 1 year
 
 serve(async (req) => {
+  const origin = req.headers.get('origin')
+
+  // Handle CORS preflight
+  if (req.method === 'OPTIONS') {
+    return handleCorsPreflight(origin)
+  }
+
   try {
-    const body = await req.json()
-    const startDate = body.start_date
-    const endDate = body.end_date
-    const stage = body.stage
+    // Read and validate request body
+    const body = await readRequestBody(req)
+    const data = exportSchema.parse(body)
 
-    if (!startDate || !endDate) {
-      return new Response(
-        JSON.stringify({ error: 'start_date and end_date are required' }),
-        { status: 400, headers: { 'Content-Type': 'application/json' } }
+    // Validate date range
+    const startDate = new Date(data.start_date)
+    const endDate = new Date(data.end_date)
+
+    if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
+      throw new AppError('Invalid date format', ErrorCodes.VALIDATION_ERROR, 400)
+    }
+
+    if (startDate > endDate) {
+      throw new AppError('start_date must be before end_date', ErrorCodes.VALIDATION_ERROR, 400)
+    }
+
+    const daysDiff = Math.ceil((endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24))
+    if (daysDiff > MAX_DATE_RANGE_DAYS) {
+      throw new AppError(
+        `Date range exceeds maximum of ${MAX_DATE_RANGE_DAYS} days`,
+        ErrorCodes.VALIDATION_ERROR,
+        400
       )
     }
 
+    // Authenticate request
     const authHeader = req.headers.get('Authorization')
-    if (!authHeader) {
-      return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 })
-    }
+    const { userId, orgId, supabaseAdmin } = await authenticateRequest(authHeader)
 
-    // Create Supabase client with service role for admin operations
-    const supabaseAdmin = createClient(
-      Deno.env.get('SUPABASE_URL') ?? '',
-      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
-    )
-
-    // Extract user_id from JWT token
-    const token = authHeader.replace('Bearer ', '')
-    const payload = JSON.parse(
-      atob(token.split('.')[1])
-    )
-    const userId = payload.sub
-
-    if (!userId) {
-      return new Response(JSON.stringify({ error: 'Invalid token' }), { status: 401 })
-    }
-
-    // Get user's org_id from org_members table (never trust client)
-    const { data: orgMember, error: orgError } = await supabaseAdmin
-      .from('org_members')
-      .select('org_id')
-      .eq('user_id', userId)
-      .limit(1)
-      .single()
-
-    if (orgError || !orgMember) {
-      return new Response(
-        JSON.stringify({ error: 'User not associated with an organization' }),
-        { status: 403 }
-      )
-    }
-
-    const orgId = orgMember.org_id
+    // Rate limiting (stricter for exports)
+    checkRateLimit(userId)
 
     // Build query
     let query = supabaseAdmin
       .from('events')
       .select('*')
       .eq('org_id', orgId)
-      .gte('ts_server', startDate)
-      .lte('ts_server', endDate)
+      .gte('ts_server', startDate.toISOString())
+      .lte('ts_server', endDate.toISOString())
 
-    if (stage) {
-      query = query.eq('stage', stage)
+    if (data.stage) {
+      query = query.eq('stage', data.stage)
     }
 
     const { data: events, error } = await query.order('ts_server', { ascending: true })
 
     if (error) throw error
 
-    // Convert to CSV
+    // Convert to CSV with proper escaping
     const headers = [
       'event_id',
       'unit_id',
@@ -93,24 +95,51 @@ serve(async (req) => {
       ...(events || []).map((event) =>
         headers.map((header) => {
           const value = event[header] ?? ''
-          return `"${String(value).replace(/"/g, '""')}"`
+          // Proper CSV escaping: escape quotes and wrap in quotes
+          const stringValue = String(value).replace(/"/g, '""')
+          return `"${stringValue}"`
         }).join(',')
       ),
     ]
 
     const csv = csvRows.join('\n')
 
-    return new Response(csv, {
+    // Audit logging
+    await logAuditEvent(
+      {
+        user_id: userId,
+        org_id: orgId,
+        action: 'csv_exported',
+        resource_type: 'export',
+        metadata: {
+          start_date: data.start_date,
+          end_date: data.end_date,
+          stage: data.stage,
+          event_count: events?.length || 0,
+        },
+        ip_address: req.headers.get('x-forwarded-for') || req.headers.get('x-real-ip') || undefined,
+        user_agent: req.headers.get('user-agent') || undefined,
+      },
+      supabaseAdmin
+    )
+
+    const response = new Response(csv, {
       headers: {
         'Content-Type': 'text/csv',
-        'Content-Disposition': `attachment; filename="events_${startDate}_${endDate}.csv"`,
+        'Content-Disposition': `attachment; filename="events_${data.start_date}_${data.end_date}.csv"`,
+        ...getCorsHeaders(origin),
       },
     })
+
+    return response
   } catch (error) {
-    return new Response(
-      JSON.stringify({ error: error.message }),
-      { status: 400, headers: { 'Content-Type': 'application/json' } }
-    )
+    const response = createErrorResponse(error)
+    
+    // Add CORS headers even for errors
+    Object.entries(getCorsHeaders(origin)).forEach(([key, value]) => {
+      response.headers.set(key, value)
+    })
+
+    return response
   }
 })
-
