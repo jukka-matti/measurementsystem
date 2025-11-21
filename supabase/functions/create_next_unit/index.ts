@@ -2,56 +2,37 @@
 // Creates the next unit from a batch (optional feature)
 
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 import { z } from 'https://deno.land/x/zod@v3.22.4/mod.ts'
+import { authenticateRequest } from '../_shared/auth.ts'
+import { createErrorResponse, createSuccessResponse, AppError, ErrorCodes } from '../_shared/errors.ts'
+import { getCorsHeaders, handleCorsPreflight } from '../_shared/cors.ts'
+import { checkRateLimit } from '../_shared/rate-limit.ts'
+import { readRequestBody } from '../_shared/validation.ts'
+import { logAuditEvent } from '../_shared/audit.ts'
 
 const createUnitSchema = z.object({
   batch_id: z.string().uuid(),
 })
 
 serve(async (req) => {
+  const origin = req.headers.get('origin')
+
+  // Handle CORS preflight
+  if (req.method === 'OPTIONS') {
+    return handleCorsPreflight(origin)
+  }
+
   try {
-    const body = await req.json()
+    // Read and validate request body
+    const body = await readRequestBody(req)
     const data = createUnitSchema.parse(body)
 
+    // Authenticate request
     const authHeader = req.headers.get('Authorization')
-    if (!authHeader) {
-      return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 })
-    }
+    const { userId, orgId, supabaseAdmin } = await authenticateRequest(authHeader)
 
-    // Create Supabase client with service role for admin operations
-    const supabaseAdmin = createClient(
-      Deno.env.get('SUPABASE_URL') ?? '',
-      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
-    )
-
-    // Extract user_id from JWT token
-    const token = authHeader.replace('Bearer ', '')
-    const payload = JSON.parse(
-      atob(token.split('.')[1])
-    )
-    const userId = payload.sub
-
-    if (!userId) {
-      return new Response(JSON.stringify({ error: 'Invalid token' }), { status: 401 })
-    }
-
-    // Get user's org_id from org_members table (never trust client)
-    const { data: orgMember, error: orgError } = await supabaseAdmin
-      .from('org_members')
-      .select('org_id')
-      .eq('user_id', userId)
-      .limit(1)
-      .single()
-
-    if (orgError || !orgMember) {
-      return new Response(
-        JSON.stringify({ error: 'User not associated with an organization' }),
-        { status: 403 }
-      )
-    }
-
-    const orgId = orgMember.org_id
+    // Rate limiting
+    checkRateLimit(userId)
 
     // Verify batch belongs to user's org
     const { data: batch, error: batchError } = await supabaseAdmin
@@ -62,7 +43,7 @@ serve(async (req) => {
       .single()
 
     if (batchError || !batch) {
-      return new Response(JSON.stringify({ error: 'Batch not found' }), { status: 404 })
+      throw new AppError('Batch not found or does not belong to your organization', ErrorCodes.NOT_FOUND, 404)
     }
 
     // Call the database function
@@ -80,24 +61,47 @@ serve(async (req) => {
       .single()
 
     if (!unit) {
-      return new Response(JSON.stringify({ error: 'Unit not found after creation' }), {
-        status: 500,
-      })
+      throw new AppError('Unit not found after creation', ErrorCodes.INTERNAL_ERROR, 500)
     }
 
-    return new Response(
-      JSON.stringify({
-        success: true,
-        unit_id: unit.id,
-        unit_number: unit.unit_number,
-      }),
-      { headers: { 'Content-Type': 'application/json' } }
+    // Audit logging
+    await logAuditEvent(
+      {
+        user_id: userId,
+        org_id: orgId,
+        action: 'unit_created',
+        resource_type: 'unit',
+        resource_id: unit.id,
+        metadata: {
+          batch_id: data.batch_id,
+          unit_number: unit.unit_number,
+        },
+        ip_address: req.headers.get('x-forwarded-for') || req.headers.get('x-real-ip') || undefined,
+        user_agent: req.headers.get('user-agent') || undefined,
+      },
+      supabaseAdmin
     )
+
+    const response = createSuccessResponse({
+      success: true,
+      unit_id: unit.id,
+      unit_number: unit.unit_number,
+    })
+
+    // Add CORS headers
+    Object.entries(getCorsHeaders(origin)).forEach(([key, value]) => {
+      response.headers.set(key, value)
+    })
+
+    return response
   } catch (error) {
-    return new Response(
-      JSON.stringify({ error: error.message }),
-      { status: 400, headers: { 'Content-Type': 'application/json' } }
-    )
+    const response = createErrorResponse(error)
+    
+    // Add CORS headers even for errors
+    Object.entries(getCorsHeaders(origin)).forEach(([key, value]) => {
+      response.headers.set(key, value)
+    })
+
+    return response
   }
 })
-

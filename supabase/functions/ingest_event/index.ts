@@ -2,8 +2,13 @@
 // Handles single event ingestion with validation and idempotency
 
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 import { z } from 'https://deno.land/x/zod@v3.22.4/mod.ts'
+import { authenticateRequest, validateUnitOwnership, validateOrderOwnership } from '../_shared/auth.ts'
+import { createErrorResponse, createSuccessResponse, AppError, ErrorCodes } from '../_shared/errors.ts'
+import { getCorsHeaders, handleCorsPreflight } from '../_shared/cors.ts'
+import { checkRateLimit } from '../_shared/rate-limit.ts'
+import { readRequestBody } from '../_shared/validation.ts'
+import { logAuditEvent } from '../_shared/audit.ts'
 
 const eventSchema = z.object({
   unit_id: z.string().uuid(),
@@ -29,59 +34,37 @@ const eventSchema = z.object({
 })
 
 serve(async (req) => {
+  const origin = req.headers.get('origin')
+
+  // Handle CORS preflight
+  if (req.method === 'OPTIONS') {
+    return handleCorsPreflight(origin)
+  }
+
   try {
-    const body = await req.json()
+    // Read and validate request body
+    const body = await readRequestBody(req)
     const data = eventSchema.parse(body)
 
+    // Authenticate request
     const authHeader = req.headers.get('Authorization')
-    if (!authHeader) {
-      return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 })
-    }
+    const { userId, orgId, supabaseAdmin } = await authenticateRequest(authHeader)
 
-    // Create Supabase client with service role for admin operations
-    const supabaseAdmin = createClient(
-      Deno.env.get('SUPABASE_URL') ?? '',
-      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
-    )
+    // Rate limiting
+    checkRateLimit(userId)
 
-    // Create client with user's auth token for RLS
-    const supabase = createClient(
-      Deno.env.get('SUPABASE_URL') ?? '',
-      Deno.env.get('SUPABASE_ANON_KEY') ?? '',
-      {
-        global: {
-          headers: { Authorization: authHeader },
-        },
-      }
-    )
-
-    // Extract user_id from JWT token
-    const token = authHeader.replace('Bearer ', '')
-    const payload = JSON.parse(
-      atob(token.split('.')[1])
-    )
-    const userId = payload.sub
-
-    if (!userId) {
-      return new Response(JSON.stringify({ error: 'Invalid token' }), { status: 401 })
-    }
-
-    // Get user's org_id from org_members table (never trust client)
-    const { data: orgMember, error: orgError } = await supabaseAdmin
-      .from('org_members')
-      .select('org_id')
-      .eq('user_id', userId)
-      .limit(1)
-      .single()
-
-    if (orgError || !orgMember) {
-      return new Response(
-        JSON.stringify({ error: 'User not associated with an organization' }),
-        { status: 403 }
+    // CRITICAL SECURITY FIX: Validate unit and order ownership
+    const unit = await validateUnitOwnership(supabaseAdmin, data.unit_id, orgId)
+    
+    // Verify order_id matches the unit's order_id and belongs to org
+    if (unit.order_id !== data.order_id) {
+      throw new AppError(
+        'Order ID does not match the unit\'s order',
+        ErrorCodes.VALIDATION_ERROR,
+        400
       )
     }
-
-    const orgId = orgMember.org_id
+    await validateOrderOwnership(supabaseAdmin, data.order_id, orgId)
 
     // Generate idempotency key
     const tsSeconds = Math.floor(new Date(data.ts_device).getTime() / 1000)
@@ -102,13 +85,14 @@ serve(async (req) => {
       .single()
 
     if (existing) {
-      return new Response(
-        JSON.stringify({ success: true, event_id: existing.id, duplicate: true }),
-        { headers: { 'Content-Type': 'application/json' } }
-      )
+      return createSuccessResponse({
+        success: true,
+        event_id: existing.id,
+        duplicate: true,
+      })
     }
 
-    // Insert event (use admin client to bypass RLS, but org_id is validated)
+    // Insert event
     const { data: event, error } = await supabaseAdmin
       .from('events')
       .insert({
@@ -131,15 +115,45 @@ serve(async (req) => {
 
     if (error) throw error
 
-    return new Response(
-      JSON.stringify({ success: true, event_id: event.id, duplicate: false }),
-      { headers: { 'Content-Type': 'application/json' } }
+    // Audit logging
+    await logAuditEvent(
+      {
+        user_id: userId,
+        org_id: orgId,
+        action: 'event_created',
+        resource_type: 'event',
+        resource_id: event.id,
+        metadata: {
+          unit_id: data.unit_id,
+          stage: data.stage,
+          type: data.type,
+        },
+        ip_address: req.headers.get('x-forwarded-for') || req.headers.get('x-real-ip') || undefined,
+        user_agent: req.headers.get('user-agent') || undefined,
+      },
+      supabaseAdmin
     )
+
+    const response = createSuccessResponse({
+      success: true,
+      event_id: event.id,
+      duplicate: false,
+    })
+
+    // Add CORS headers
+    Object.entries(getCorsHeaders(origin)).forEach(([key, value]) => {
+      response.headers.set(key, value)
+    })
+
+    return response
   } catch (error) {
-    return new Response(
-      JSON.stringify({ error: error.message }),
-      { status: 400, headers: { 'Content-Type': 'application/json' } }
-    )
+    const response = createErrorResponse(error)
+    
+    // Add CORS headers even for errors
+    Object.entries(getCorsHeaders(origin)).forEach(([key, value]) => {
+      response.headers.set(key, value)
+    })
+
+    return response
   }
 })
-
